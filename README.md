@@ -1,94 +1,103 @@
-# az-policy-enum
+# az-ado-enum
 
-Azure Policy enumeration script for red team and security assessment engagements. Walks the full Management Group → Subscription → Resource Group scope hierarchy and surfaces policy misconfigurations, DINE MSI blast radius, exemptions, and non-compliant resources.
+Azure DevOps enumeration script for red team and security assessment engagements. Flips an ARM token to an ADO token and walks the full org → project hierarchy.
 
-Uses the current `az` CLI session.
-
-## What it enumerates
-
-- **Management group hierarchy** - all MGs visible to the current identity
-- **Policy assignments** - at MG, subscription, and RG scope, including enforcement mode and notScopes
-- **Custom policy definitions** - effect, defined-at scope, DINE/Modify flag
-- **Custom initiatives** - constituent policies with effect overrides
-- **Exemptions** - category, expiry, scope
-- **DINE MSI blast radius** - role assignments held by each DeployIfNotExists/Modify managed identity
-- **Non-compliant resources** - per policy, collapsed to `rg/type/name` format
-
-## Findings
-
-The script uses three severity levels:
-
-| Prefix | Colour | Meaning |
-|--------|--------|---------|
-| `[+]` | Red | High - direct attack path or significant misconfiguration |
-| `[+]` | Yellow | Medium - worth investigating, context-dependent |
-| `[-]` | Cyan | Info - enumeration output, no immediate risk |
-| `[!]` | Yellow | Warning - command failed or data unavailable |
-
-Key findings surfaced:
-
-- `DoNotEnforce` assignments - policy is evaluating but not blocking; findings exist in the compliance API even though resource creation is not denied
-- `notScopes` - scopes excluded from policy enforcement; common source of unintended gaps
-- DINE MSI with role assignments - the MSI's ARM permissions define the blast radius if the policy definition is poisoned or a remediation is triggered by an attacker
-- DINE MSI with no role assignments - identity exists but is inoperative; could be granted roles by an attacker with sufficient ARM permissions
+Uses the current `az` CLI session. No additional authentication required.
 
 ## Prerequisites
 
 - `az` CLI installed and authenticated (`az login`)
+- `curl` available in PATH
 - Python 3.6+
-- Sufficient permissions to read policy state - Reader at the relevant scope is enough for most enumeration; DINE blast radius enumeration requires the ability to query role assignments at tenant scope
+- ADO Contributor on the target project (sufficient for full enumeration). Lower privileges will still enumerate projects, repos, pipelines, agent pools, and branch policies but may return empty results for service connections, secure files, and pipeline permission checks
 
 ## Usage
 
 ```bash
-python3 az_policy_enum.py
+python3 az_ado_enum.py
 ```
 
-The script uses whichever subscription and identity is active in the current `az` CLI session. To target a specific subscription:
-
-```bash
-az account set --subscription <subscription-id>
-python3 az_policy_enum.py
-```
-
-To target a different tenant:
+To target a specific tenant:
 
 ```bash
 az login --tenant <tenant-id>
-python3 az_policy_enum.py
+python3 az_ado_enum.py
 ```
+
+## What it enumerates
+
+- Identity and org discovery
+- Agent pools (self-hosted vs Microsoft-hosted, agent hostname, OS, user)
+- Projects and repos (default branch, sensitive file detection)
+- Pipelines (YAML path, triggers, variable group and service connection references, `addSpnToEnvironment`)
+- Service connections (type, scheme, SP client ID, permitted pipelines)
+- Variable groups (plain variables, ADO-stored secrets, KV-backed secrets)
+- Secure files (name, creator, open access)
+- Branch policies (minimum reviewers, build validation, required reviewers, missing policy detection)
+- Environments (approval gates and approvers)
+
+## Output
+
+- `[+]` red - high severity finding
+- `[+]` yellow - medium severity finding
+- `[-]` cyan - enumeration info
+- `[!]` yellow - command failed or data unavailable
 
 ## Example output
 
 ```
 ════════════════════════════════════════════════════════════
-  Current Identity
+  Identity & Org Discovery
 ════════════════════════════════════════════════════════════
-    [-] User:           dodgy.dave@example.com
-    [-] Tenant:         52318b96-87fc-4231-8f87-uu6c5cb64323
-    [-] Subscription:   dodgy-sub-prod (a7f3c291-84de-4b32-9f1e-8a2d657e3c10)
+    [-] ARM identity:   j.smith@contoso.com
+    [-] Tenant:         xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+    [-] Subscription:   sub-prod (xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx)
+    [-] ADO identity:   J Smith (j.smith@contoso.com)
+    [-] ADO member ID:  xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+    [-] Org:            contoso (id: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx)
 
-  ▸ Assignments @ Sub:dodgy-sub-prod
-    [-] AKS-Compliance
-    [-]   - Kubernetes cluster containers should only use allowed images (effect: Deny)
-    [-]   - AKS naming convention (effect: Audit)
-    [-]   - Azure Policy add-on for Kubernetes (effect: DeployIfNotExists)
-    [+] notScopes (1): /subscriptions/.../rg-prod-shared
-    [+] DINE MSI detected - principalId: b3d82f14-6c91-4a27-8e05-d1f749c23a87
+  ▸ Agent Pools - contoso
+    [-] Default (id: 1) - self-hosted
+    [+] Self-hosted pool 'Default' - agents run on customer infrastructure; lateral movement to agent VM possible via pipeline code execution
+    [-]   Agent: vm-prod-azdo - OS: Ubuntu 24.04.1 LTS, version: 4.248.0, status: online
+    [-]     Agent.ComputerName: vm-prod-azdo
+    [-]     Agent.HomeDirectory: /home/azdoagent/agent
 
-════════════════════════════════════════════════════════════
-  DINE MSI Blast Radius
-════════════════════════════════════════════════════════════
-  ▸ MSI: AKS-Compliance (b3d82f14-6c91-4a27-8e05-d1f749c23a87)
-    [+] Azure Kubernetes Service Contributor Role @ /subscriptions/.../rg-prod-workloads
+  ▸ Pipeline Definitions (YAML analysis) - platform
+    [-]   [policy-pipeline] trigger: continuousIntegration
+    [+] [policy-pipeline] addSpnToEnvironment: true in azure-pipelines.yml - OIDC idToken injected into environment at pipeline runtime
+
+  ▸ Service Connections - platform
+    [-] sc-platform - type: azurerm, scheme: WorkloadIdentityFederation
+    [-]   SP object ID / client ID: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+    [-]   [sc-platform] WIF - OIDC token issued at pipeline runtime (no stored secret)
+    [-]   [sc-platform] pipelines permitted to use this connection: policy-pipeline, image-build-pipeline
+    [-] sc-acr - type: dockerregistry, scheme: ServicePrincipal
+    [+] [sc-acr] ServicePrincipal scheme - static SP credential stored in ADO; no OIDC exchange, credential extraction directly usable
+
+  ▸ Variable Groups - platform
+    [-] vg-build - type: Vsts
+    [-]   acrName = acrprodworkloads
+    [-]   imageRepository = invoices-api
+    [-] vg-prod-kv - type: AzureKeyVault
+    [-]   KV-backed - vault: kv-prod-workloads
+    [-]   Secret: prod-signing-key -> value: null (fetched at runtime)
+    [+] [vg-prod-kv] KV-backed secret 'prod-signing-key' in vault 'kv-prod-workloads' - pipeline SP has Key Vault read access; lateral movement path to KV
+
+  ▸ Secure Files - platform
+    [-] imagesign.pem (id: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx, created by: A. Lopez)
+    [+] Secure file 'imagesign.pem' - contents not readable via API; retrievable by injecting DownloadSecureFile@1 task into an authorised pipeline
+    [+] [imagesign.pem] Open access - any pipeline can download this secure file
+
+  ▸ Branch Policies - platform
+    [-] Branch: policy-repo:refs/heads/main
+    [-]   Minimum number of reviewers - enabled, blocking
+    [-]   Build - enabled, blocking
+    [+] Build validation policy 'Terraform plan' - pipeline runs during PR (plan phase); malicious YAML in PR branch executes before approval
+    [-]   Required reviewers - enabled, blocking
+    [-]     Required reviewer: a.lopez@contoso.com
+    [-] Branch: app-deploy-repo:refs/heads/main
+    [+] No minimum reviewer policy on app-deploy-repo:refs/heads/main - PR could be self-approved or merged without review
+    [-]   No build validation on app-deploy-repo:refs/heads/main
 ```
 
-## Attack surface interpretation
-
-**DINE MSI abuse path**: If an identity with `policyDefinitions/write` modifies the DINE policy definition to execute attacker-controlled ARM operations, and then triggers a remediation task, the MSI executes those operations. The MSI's role assignments define the blast radius. This does not require the MSI token to be directly accessible - the escalation path is through definition poisoning followed by remediation trigger.
-
-**notScopes**: A resource group in notScopes is entirely exempt from the initiative. Resources deployed there are not subject to the Deny effect. Useful for identifying where policy enforcement gaps exist that could be used to deploy out-of-policy resources.
-
-## Notes
-
-- Defender for Cloud subscription-scope non-compliance is collapsed to a single summary line rather than listing individual plan findings
